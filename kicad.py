@@ -15,7 +15,13 @@ import Path
 
 import sys, os
 sys.path.append(os.path.dirname(os.path.realpath(__file__)))
-from kicad_parser import KicadPCB,SexpList
+from .kicad_parser import KicadPCB,SexpList
+
+PY3 = sys.version_info[0] == 3
+if PY3:
+    string_types = str,
+else:
+    string_types = basestring,
 
 def updateGui():
     try:
@@ -78,7 +84,7 @@ def isZero(f):
 
 def makeColor(*color):
     if len(color)==1:
-        if isinstance(color[0],basestring):
+        if isinstance(color[0],string_types):
             color = int(color[0],0)
         else:
             color = color[0]
@@ -191,9 +197,15 @@ def makeArc(center,start,angle):
     a = -degrees(DraftVecUtils.angle(p))
     # NOTE: KiCAD pcb geometry runs in clockwise, while FreeCAD is CCW. So the
     # resulting arc below is the reverse of what's specified in kicad_pcb
-    arc = Part.makeCircle(r,center,Vector(0,0,1),a-angle,a)
-    arc.reverse();
+    if angle>0:
+        arc = Part.makeCircle(r,center,Vector(0,0,1),a-angle,a)
+        arc.reverse();
+    else:
+        arc = Part.makeCircle(r,center,Vector(0,0,1),a,a-angle)
     return arc
+
+def makeCurve(poles):
+    return Part.BSplineCurve(poles).toShape()
 
 def findWires(edges):
     try:
@@ -244,20 +256,27 @@ def unpack(obj):
     return obj
 
 
-def getKicadPath():
-    if sys.platform != 'win32':
-        path='/usr/share/kicad/modules/packages3d'
-        if not os.path.isdir(path):
-            path = '/usr/local/share/kicad/modules/packages3d'
-        return path
+def getKicadPath(env=''):
+    confpath = ''
+    if env:
+        confpath = os.path.expanduser(os.environ.get(env,''))
+        if not os.path.isdir(confpath):
+            confpath=''
+    if not confpath:
+        if sys.platform == 'darwin':
+            confpath = os.path.expanduser('~/Library/Preferences/kicad')
+        elif sys.platform == 'win32':
+            confpath = os.path.join(
+                    os.path.abspath(os.environ['APPDATA']),'kicad')
+        else:
+            confpath=os.path.expanduser('~/.config/kicad')
 
     import re
-    confpath = os.path.join(os.path.abspath(os.environ['APPDATA']),'kicad')
     kicad_common = os.path.join(confpath,'kicad_common')
     if not os.path.isfile(kicad_common):
         logger.warning('cannot find kicad_common')
         return None
-    with open(kicad_common,'rb') as f:
+    with open(kicad_common,'r') as f:
         content = f.read()
     match = re.search(r'^\s*KISYS3DMOD\s*=\s*([^\r\n]+)',content,re.MULTILINE)
     if not match:
@@ -320,15 +339,20 @@ class KicadFcad:
         self.sketch_use_draft = False
         self.sketch_radius_precision = -1
         self.holes_cache = {}
+        self.work_plane = Part.makeCircle(1)
         self.active_doc_uuid = None
         self.sketch_constraint = True
         self.sketch_align_constraint = False
         self.merge_holes = not debug
         self.merge_pads = not debug
         self.merge_vias = not debug
+        self.merge_tracks = not debug
         self.zone_merge_holes = not debug
         self.add_feature = True
-        self.part_path = getKicadPath()
+        self.part_path = None
+        self.path_env = 'KICAD_CONFIG_HOME'
+        self.hole_size_offset = 0.0001
+        self.nets = []
         if filename is None:
             filename = '/home/thunder/pwr.kicad_pcb'
         if not os.path.isfile(filename):
@@ -348,13 +372,22 @@ class KicadFcad:
                 raise ValueError('unknown parameter "{}"'.format(key))
             setattr(self,key,value)
 
+        if not self.part_path:
+            self.part_path = getKicadPath(self.path_env)
         self.pcb = KicadPCB.load(self.filename)
 
         # This will be override by setLayer. It's here just to make syntax
         # checker happy
-        self.layer = 'Fu.C'
+        self.layer = 'F.Cu'
 
         self.setLayer(self.layer_type)
+
+        self._nets = set()
+        self.net_names = dict()
+        if 'net' in self.pcb:
+            for n in self.pcb.net:
+                self.net_names[n[0]] = n[1]
+            self.setNetFilter(*self.nets)
 
     def setLayer(self,layer):
         try:
@@ -372,6 +405,42 @@ class KicadFcad:
             self.layer_type = layer
             self.layer = self.pcb.layers[str(layer)][0]
 
+    def setNetFilter(self,*nets):
+        ndict = dict()
+        nset = set()
+        for n in self.pcb.net:
+            ndict[n[1]] = n[0]
+            nset.add(n[0])
+
+        for n in nets:
+            try:
+                self._nets.add(ndict[str(n)])
+                continue
+            except Exception:
+                pass
+            try:
+                if int(n) in nset:
+                    self._nets.add(int(n))
+                    continue
+            except Exception:
+                pass
+            logger.error('net {} not found'.format(n))
+
+    def getNet(self,p):
+        n = p.net
+        return n if not isinstance(n,list) else n[0]
+
+    def filterNets(self,p):
+        try:
+            return self._nets and self.getNet(p) not in self._nets
+        except Exception:
+            return bool(self._nets)
+
+    def netName(self,p):
+        try:
+            return self.net_names[self.getNet(p)]
+        except Exception:
+            return 'net?'
 
     def _log(self,msg,*arg,**kargs):
         level = 'info'
@@ -548,7 +617,7 @@ class KicadFcad:
 
 
     def _makeArea(self,obj,name,offset=0,op=0,fill=None,label=None,
-                    force=False,fit_arcs=False,reorient=False):
+                force=False,fit_arcs=False,reorient=False,workplane=False):
         if fill is None:
             fill = 2
         elif fill:
@@ -576,6 +645,8 @@ class KicadFcad:
                 ret.Fill = fill
                 ret.Offset = offset
                 ret.Coplanar = 0
+                if workplane:
+                    ret.WorkPlane = self.work_plane
                 ret.FitArcs = fit_arcs
                 ret.Reorient = reorient
                 for o in obj:
@@ -584,6 +655,8 @@ class KicadFcad:
             recomputeObj(ret)
         else:
             ret = Path.Area(Fill=fill,FitArcs=fit_arcs,Coplanar=0)
+            if workplane:
+                ret.setPlane(self.work_plane)
             for o in obj:
                 ret.add(o,op=op)
             if offset:
@@ -593,7 +666,8 @@ class KicadFcad:
         return ret
 
 
-    def _makeWires(self,obj,name,offset=0,fill=False,label=None,fit_arcs=False):
+    def _makeWires(self,obj,name,offset=0,fill=False,label=None,
+            fit_arcs=False,workplane=False):
 
         if self.add_feature:
             if self.make_sketch:
@@ -617,7 +691,7 @@ class KicadFcad:
 
         if fill or offset:
             return self._makeArea(obj,name,offset=offset,fill=fill,
-                    fit_arcs=fit_arcs,label=label)
+                    fit_arcs=fit_arcs,label=label,workplane=workplane)
         else:
             return self._makeCompound(obj,name,label=label)
 
@@ -705,37 +779,145 @@ class KicadFcad:
         for l in self.pcb.gr_line:
             if l.layer != 'Edge.Cuts':
                 continue
-            edges.append(Part.makeLine(makeVect(l.start),makeVect(l.end)))
+            edges.append([l.width,
+                Part.makeLine(makeVect(l.start),makeVect(l.end))])
 
         self._log('making {} arcs',len(self.pcb.gr_arc))
         for l in self.pcb.gr_arc:
             if l.layer != 'Edge.Cuts':
                 continue
             # for gr_arc, 'start' is actual the center, and 'end' is the start
-            edges.append(makeArc(makeVect(l.start),makeVect(l.end),l.angle))
+            edges.append([l.width,
+                makeArc(makeVect(l.start),makeVect(l.end),l.angle)])
+
+        if hasattr(self.pcb,'gr_curve'):
+            self._log('making {} curves',len(self.pcb.gr_curve))
+            for l in self.pcb.gr_curve:
+                if l.layer != 'Edge.Cuts':
+                    continue
+                edges.append([l.width,
+                    makeCurve([makeVect(p) for p in SexpList(l.pts.xy)])])
 
         if not edges:
             self._popLog('no board edges found')
             return
 
-        wires = findWires(edges)
+        # The line width in edge cuts are important. When milling, the line
+        # width can represent the diameter of the drill bits to use. The user
+        # can use lines thick enough for hole cutting. In addition, the
+        # endpoints of thick lines do not have to coincide to complete a loop.
+        #
+        # Therefore, we shall use the line width as tolerance to detect closed
+        # wires. And for non-closed wires, if the shape_type is not wire, we
+        # shall thicken the wire using Path.Area for hole cutting.
+
+        for info in edges:
+            w,e = info
+            e.fixTolerance(w)
+            info += [e.firstVertex().Point,e.lastVertex().Point]
+
+        non_closed = defaultdict(list)
+
+        wires = []
+        while edges:
+            w,e,pstart,pend = edges.pop(-1)
+            wstart = wend = w
+            elist = [(w,e)]
+            closed = False
+            i = 0
+            while i < len(edges):
+                w,e,ps,pe = edges[i]
+                if pstart.distanceToPoint(ps) < (wstart+w)/2:
+                    e.reverse()
+                    pstart = pe
+                    wstart = w
+                    elist.insert(0,(w,e))
+                elif pstart.distanceToPoint(pe) < (wstart+w)/2:
+                    pstart = ps
+                    wstart = w
+                    elist.insert(0,(w,e))
+                elif pend.distanceToPoint(ps) < (wend+w)/2:
+                    e.reverse()
+                    pend = pe
+                    wend = w
+                    elist.append((w,e))
+                elif pend.distanceToPoint(pe) < (wend+w)/2:
+                    pend = ps
+                    wend = w
+                    elist.append((w,e))
+                else:
+                    i += 1
+                    continue
+                edges.pop(i)
+                i = 0
+                if pstart.distanceToPoint(pend) < (wstart+wend)/2:
+                    closed = True
+                    break
+
+            wire = None
+            try:
+                #  tol = max([o[0] for o in elist])
+                #  wire = Part.makeWires([o[1] for o in elist],'',tol,True)
+
+                wire = Part.Wire([o[1] for o in elist])
+                #  wire.fixWire(None,tol)
+                #  wire.fix(tol,tol,tol)
+            except Exception:
+                pass
+
+            if closed and (not wire or not wire.isClosed()):
+                logger.warning('wire not closed')
+                closed = False
+
+            if wire and closed:
+                wires.append(wire)
+            else:
+                for w,e in elist:
+                    non_closed[w].append(e)
 
         if not thickness:
             thickness = self.pcb.general.thickness
 
-        holes = self._cutHoles(None,holes,None,
-                        minSize=minHoleSize,oval=ovalHole)
+        def _addHoles(objs):
+            h = self._cutHoles(None,holes,None,
+                            minSize=minHoleSize,oval=ovalHole)
+            if isinstance(h,(tuple,list)):
+                objs += h
+            elif holes:
+                objs.append(h)
+            return objs
 
-        def _wire(fill=False):
-            obj = self._makeWires(wires,'board',fill=fill)
-            if not holes:
-                return obj
+        def _wire():
+            objs = []
 
-            return self._makeArea((obj,holes),'board',
-                            op=1,fill=fill,fit_arcs=fit_arcs)
+            if wires:
+                objs.append(self._makeWires(wires,'board'))
+
+            for width,edges in iteritems(non_closed):
+                objs.append(self._makeWires(edges,'board',label=width))
+
+            return self._makeCompound(_addHoles(objs),'board')
 
         def _face():
-            return _wire(True)
+            if not wires:
+                raise RuntimeError('no closed wire')
+
+            # Pick the wire with the largest area as outline
+            areas = [ Part.Face(w).Area for w in wires ]
+            outer = wires.pop(areas.index(max(areas)))
+
+            objs = [ self._makeWires(outer,'board',label='outline') ]
+            if wires:
+                objs.append(self._makeWires(wires,'board',label='inner'))
+
+            for width,elist in iteritems(non_closed):
+                wire = self._makeWires(elist,'board',label=width)
+                # thicken non closed wire for hole cutting
+                objs.append(self._makeArea(wire,'board',label=width,
+                                           offset = width*0.5))
+
+            return self._makeArea(_addHoles(objs),'board',
+                            op=1,fill=True,fit_arcs=fit_arcs)
 
         def _solid():
             return self._makeSolid(_face(),'board',thickness,
@@ -783,29 +965,36 @@ class KicadFcad:
         oval_count = 0
         count = 0
         skip_count = 0
+        if not offset:
+            offset = self.hole_size_offset;
         for m in self.pcb.module:
             m_at,m_angle = getAt(m.at)
             for p in m.pad:
                 if 'drill' not in p:
                     continue
-                if npth:
-                    if p[1]=='np_thru_hole':
-                        if npth<0:
-                            skip_count += 1
-                            continue
-                    elif npth>0:
+                if self.filterNets(p):
+                    skip_count += 1
+                    continue
+                if p[1]=='np_thru_hole':
+                    if npth<0:
                         skip_count += 1
                         continue
+                    ofs = abs(offset)
+                else:
+                    if npth>0:
+                        skip_count += 1
+                        continue
+                    ofs = -abs(offset)
                 if p.drill.oval:
                     if not oval:
                         continue
                     size = Vector(p.drill[0],p.drill[1])
-                    w = make_oval(size+Vector(offset,offset))
+                    w = make_oval(size+Vector(ofs,ofs))
                     ovals[min(size.x,size.y)].append(w)
                     oval_count += 1
                 elif p.drill[0]>=minSize and \
                         (not maxSize or p.drill[0]<=maxSize):
-                    w = make_circle(Vector(p.drill[0]+offset))
+                    w = make_circle(Vector(p.drill[0]+ofs))
                     holes[p.drill[0]].append(w)
                     count += 1
                 else:
@@ -825,9 +1014,13 @@ class KicadFcad:
 
         if npth<=0:
             skip_count = 0
+            ofs = -abs(offset)
             for v in self.pcb.via:
+                if self.filterNets(v):
+                    skip_count += 1
+                    continue
                 if v.drill>=minSize and (not maxSize or v.drill<=maxSize):
-                    w = make_circle(Vector(v.drill+offset))
+                    w = make_circle(Vector(v.drill+ofs))
                     holes[v.drill].append(w)
                     w.translate(makeVect(v.at))
                 else:
@@ -882,18 +1075,24 @@ class KicadFcad:
         if not isinstance(holes,(Part.Feature,Part.Shape)):
             hit = False
             if self.holes_cache is not None:
-                key = '{}.{}.{}.{}.{}'.format(
-                        minSize,maxSize,oval,npth,offset)
+                key = '{}.{}.{}.{}.{}.{}'.format(
+                        self.add_feature,minSize,maxSize,oval,npth,offset)
                 doc = getActiveDoc();
-                if self.active_doc_uuid != doc.Uid:
+                if self.add_feature and self.active_doc_uuid!=doc.Uid:
                     self.holes_cache.clear()
                     self.active_doc_uuid = doc.Uid
 
                 try:
                     holes = self.holes_cache[key]
+                    if self.add_feature:
+                        # access the object's Name to make sure it is not
+                        # deleted
+                        self._log("fetch holes '{}' "
+                            "from cache".format(holes.Name))
+                    else:
+                        self._log("fetch holes from cache")
                     hit = True
-                    self._log("fetch holes from cache")
-                except KeyError:
+                except Exception:
                     pass
 
             if not hit:
@@ -951,6 +1150,11 @@ class KicadFcad:
                     and '*' not in p.layers:
                     skip_count+=1
                     continue
+
+                if self.filterNets(p):
+                    skip_count+=1
+                    continue
+
                 shape = p[2]
 
                 try:
@@ -967,7 +1171,7 @@ class KicadFcad:
                 w.translate(at)
                 if not self.merge_pads:
                     pads.append(func(w,'pad',
-                        '{}#{}#{}#{}'.format(i,j,p[0],ref)))
+                        '{}#{}#{}#{}#{}'.format(i,j,p[0],ref,self.netName(p))))
                 else:
                     pads.append(w)
 
@@ -984,7 +1188,7 @@ class KicadFcad:
         via_skip = 0
         vias = []
         for i,v in enumerate(self.pcb.via):
-            if self.layer not in v.layers:
+            if self.layer not in v.layers or self.filterNets(v):
                 via_skip += 1
                 continue
             w = make_circle(Vector(v.size))
@@ -1039,16 +1243,16 @@ class KicadFcad:
         self._pushLog('making tracks...',prefix=prefix)
 
         width = 0
-        def _line(edges,offset=0,fill=False):
+        def _line(edges,label,offset=0,fill=False):
             wires = findWires(edges)
-            return self._makeWires(wires,'track',
-                            offset=offset,fill=fill,label=width)
+            return self._makeWires(wires,'track', offset=offset,
+                    fill=fill, label=label, workplane=True)
 
-        def _wire(edges,fill=False):
-            return _line(edges,width*0.5,fill)
+        def _wire(edges,label,fill=False):
+            return _line(edges,label,width*0.5,fill)
 
-        def _face(edges):
-            return _wire(edges,True)
+        def _face(edges,label):
+            return _wire(edges,label,True)
 
         _solid = _face
 
@@ -1057,28 +1261,38 @@ class KicadFcad:
         except KeyError:
             raise ValueError('invalid shape type: {}'.format(shape_type))
 
-        tracks = defaultdict(list)
+        tracks = defaultdict(lambda: defaultdict(list))
         count = 0
         for s in self.pcb.segment:
+            if self.filterNets(s):
+                continue
             if s.layer == self.layer:
-                tracks[s.width].append(s)
+                if self.merge_tracks:
+                    tracks[''][s.width].append(s)
+                else:
+                    tracks[self.netName(s)][s.width].append(s)
                 count += 1
 
         objs = []
         i = 0
-        for (width,ss) in iteritems(tracks):
-            self._log('making {} tracks of width {:.2f}, ({}/{})',
-                    len(ss),width,i,count)
-            i+=len(ss)
-            edges = []
-            for s in ss:
-                if s.start != s.end:
-                    edges.append(Part.makeLine(
-                        makeVect(s.start),makeVect(s.end)))
+        for (name,sss) in iteritems(tracks):
+            for (width,ss) in iteritems(sss):
+                self._log('making {} tracks {} of width {:.2f}, ({}/{})',
+                        len(ss),name,width,i,count)
+                i+=len(ss)
+                edges = []
+                for s in ss:
+                    if s.start != s.end:
+                        edges.append(Part.makeLine(
+                            makeVect(s.start),makeVect(s.end)))
+                    else:
+                        self._log('Line (Track) through identical points {}',
+                                s.start, level="warning")
+                if self.merge_tracks:
+                    label = '{}'.format(width)
                 else:
-                    self._log('Line (Track) through identical points {}',
-                            s.start, level="warning")
-            objs.append(func(edges))
+                    label = '{}#{}'.format(width,name)
+                objs.append(func(edges,label=label))
 
         if objs:
             objs = self._cutHoles(objs,holes,'tracks',fit_arcs=fit_arcs)
@@ -1137,7 +1351,7 @@ class KicadFcad:
 
         objs = []
         for z in self.pcb.zone:
-            if z.layer != self.layer:
+            if z.layer != self.layer or self.filterNets(z):
                 continue
             count = len(z.filled_polygon)
             self._pushLog('making zone {}...', z.net_name)
@@ -1151,7 +1365,7 @@ class KicadFcad:
 
                 # `table` uses a pair of vertex as the key to store the index of
                 # an edge.
-                for i in xrange(len(pts)-1):
+                for i in range(len(pts)-1):
                     table[str((pts[i],pts[i+1]))] = i
 
                 # This is how kicad represents holes in zone polygon
@@ -1251,7 +1465,8 @@ class KicadFcad:
             if not obj:
                 continue
             if shape_type=='solid':
-                self._place(obj,Vector(0,0,offset))
+                ofs = offset if self.layer.startswith('F.') else -offset
+                self._place(obj,Vector(0,0,ofs))
             objs.append(obj)
 
         if shape_type=='solid':
@@ -1282,7 +1497,7 @@ class KicadFcad:
         layer_save = self.layer
         objs = []
         layers = []
-        for i in xrange(0,32):
+        for i in range(0,32):
             if str(i) in self.pcb.layers:
                 layers.append(i)
         if not layers:
@@ -1336,7 +1551,7 @@ class KicadFcad:
                 # make plated through holes with inward offset
                 drills = self.makeHoles(shape_type='solid',prefix=None,
                         thickness=board_thickness+6*thickness,
-                        oval=True,npth=-1,offset=-thickness)
+                        oval=True,npth=-1,offset=thickness)
                 if drills:
                     self._place(drills,FreeCAD.Vector(0,0,-thickness*2))
                     objs = self._makeCut(objs,drills,'coppers')
@@ -1498,5 +1713,34 @@ class KicadFcad:
         fitView();
         return objs
 
+def getTestFile(name):
+    import glob
+    if not os.path.exists(name):
+        path = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(path,'tests')
+        if name:
+            path = os.path.join(path,name)
+    else:
+        path = name
+    if os.path.isdir(path):
+        return glob.glob(os.path.join(path,'*.kicad_pcb'))
+    if os.path.isfile(path):
+        return [path]
+    path += '.kicad_pcb'
+    if os.path.isfile(path):
+        return [path]
+    raise RuntimeError('Cannot find {}'.format(name))
 
+def test(names=''):
+    if not isinstance(names,(tuple,list)):
+        names = [names]
+    files = set()
+    for name in names:
+        files.update(getTestFile(name))
+    for f in files:
+        pcb = KicadFcad(f)
+        pcb.make()
+        pcb.make(fuseCoppers=True)
+        pcb.add_feature = False
+        Part.show(pcb.make())
 

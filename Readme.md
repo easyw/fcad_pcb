@@ -44,6 +44,16 @@ pcb.setLayer('F.Cu')
 pcb.makeCopper()
 ```
 
+* <a name="net-filter"/>filtering by net name (for local nets you have to specify full hirarchical name)
+
+```python
+pcb.setNetFilter('GND')
+pcb.makeCopper()
+
+pcb.setNetFilter('GND','VCC')
+pcb.makeCopper()
+```
+
 In case you only want the shape without any intermediate document objects,
 
 ```python
